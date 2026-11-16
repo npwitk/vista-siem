@@ -1,0 +1,497 @@
+"""E1, E2 and E3 on real data: AIT Log Data Set V2.0 (DS2 Section "Evaluation Protocol").
+
+Split by scenario (no scenario contributes to both parts):
+  development  russellmitchell, santos, fox     learn theta, calibrate Theta and B1-tuned
+  test         harrison, wardbeck, shaw, wheeler, wilson
+Development runs also contain one injected low-and-slow attack per family (rate 8, span 12),
+so that weights can be learned for slow attacks.
+
+Parts
+  e1  A: the real attack chains of the test scenarios, per class (recon, web_attack,
+         priv_esc, dns_exfil): calibrated precision/recall/F1 and threshold-free AUC and
+         recall@FP2; systems S, SD, B2, A2, B1-default, B1-tuned
+      B: low-and-slow DNS exfiltration and slow web scanning injected into the clean
+         background of a test scenario, rate r per epoch for `span` epochs: recall, false
+         alarms, recall@FP2 (the real-data test of multi-epoch correlation)
+  e3  leakage on days 2-4 of each test scenario; the adversary's prior is day 1 of the
+      same scenario; systems S, SD, A4, SD+A4
+  e2  2048-bit throughput and bytes per event on the first day of one test scenario
+
+Thresholds are calibrated to an alert budget (benign (entity, epoch) alerts per class per
+day on the development scenarios), which is how a SOC sizes alert volume.
+
+Usage:  python experiments/ait_eval.py [--parts e1,e3,e2] [--quick] [--workers 8]
+                                       [--data ~/data/ait-ldsv2]
+        journal ablations, without overwriting the main files (outputs ait_<tag>_*):
+        python experiments/ait_eval.py --parts e1,e3 --tag journal --systems S,A2,FixedDecay,LAPH,FP \
+                                       --rules B1-default --leak-systems S,FP,LAPH,SD --fp-gamma 1.7
+
+Journal v3 baselines (--systems)
+  PT-S   the S scorer with S's learned weights and calibrated thresholds, on features computed
+         directly from the plaintext events (vista_siem/plaintext.py): no tokens, encryption or padding
+  ML-IF  IsolationForest (unsupervised) per class over the (z, h_prev) rows of the development
+         score logs; ML-GB GradientBoostingClassifier trained on the same rows with the development
+         labels (threshold from leave-one-scenario-out scores). Features come from S runs with the
+         default (uncalibrated) profiles; thresholds by theta_for_budget at the same alert budget.
+--epoch-len (default 3600 s) sets Delta_e. The --quick window, the leakage days and the injected
+attacks are defined in hours (rate per hour, span in hours), so they mean the same at every Delta_e;
+detection delays are reported in epochs (delay) and hours (delay_h).
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import platform
+import statistics
+import sys
+import time
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from common import (  # noqa: E402
+    RESULTS,
+    remap_truth,
+    FreqRule,
+    config,
+    fit_weights,
+    mean_sd,
+    rule_alerts,
+    rule_scores,
+    run,
+    score_alerts,
+    vista_siem_alerts,
+    vista_siem_scores,
+    theta_for_budget,
+    threshold_free,
+    write_csv,
+)
+from leakage import aux_distribution, decoy_distinguisher, frequency_attack, linkage_attack  # noqa: E402
+
+from vista_siem.data.ait import (  # noqa: E402
+    CLASSES,
+    INJECT_FAMILIES,
+    ait_profiles_and_contexts,
+    attack_entities,
+    benign_background,
+    inject,
+    load_scenario,
+)
+
+DEV = ["russellmitchell", "santos", "fox"]
+TEST = ["harrison", "wardbeck", "shaw", "wheeler", "wilson"]
+SYSTEMS = ["S", "SD", "B2", "A2"]
+LEAK_SYSTEMS = ["S", "SD", "A4", "SD+A4"]
+FP_GAMMA = float(os.environ.get("VISTA_FP_GAMMA", 1.5))  # env: inherited by spawned workers
+ALERTS_PER_DAY = 2          # benign alert budget per class per day (development scenarios)
+EPOCH = float(os.environ.get("VISTA_EPOCH_LEN", 3600.0))  # env: inherited by spawned workers
+HOUR = 3600.0
+ML_SYSTEMS = ("ML-IF", "ML-GB")
+DATA = Path.home() / "data" / "ait-ldsv2"
+
+
+# ============================================================================ data
+def scenario(name: str, max_epoch: int | None = None):
+    ev, truth, meta = load_scenario(DATA / name, EPOCH)
+    if max_epoch is not None:
+        ev = [e for e in ev if e.ts < max_epoch * EPOCH]
+        truth = [replace(gt, epochs=[x for x in gt.epochs if x <= max_epoch]) for gt in truth]
+        truth = [gt for gt in truth if gt.epochs]
+    return ev, truth, meta
+
+
+def hours_to_epochs(h: int | None) -> int | None:
+    return None if h is None else int(h * HOUR // EPOCH)
+
+
+def dev_stream(name: str, max_epoch: int | None):
+    """A development scenario plus one injected slow attack per family (rate 8 per hour, 12 hours)."""
+    ev, truth, meta = scenario(name, max_epoch)
+    n_ep = max_epoch or meta["epochs"]
+    n_h = int(n_ep * EPOCH // HOUR)
+    for k, fam in enumerate(sorted(INJECT_FAMILIES)):
+        start = max(1, n_h // 4 + 6 * k)
+        ev, gt = inject(ev, fam, 8, min(12, n_h - start), start, seed=100 + k, epoch_len=HOUR)
+        truth = truth + remap_truth([gt], HOUR, EPOCH)
+    return ev, truth, n_ep
+
+
+# ============================================================================ workers
+def sys_config(system: str):
+    if system in ("PT-S",) + ML_SYSTEMS:
+        return config("S", epoch_len=EPOCH)
+    over = {"epoch_len": EPOCH} if EPOCH != 3600.0 else {}
+    return config(system, gamma=FP_GAMMA, **over) if system == "FP" else config(system, **over)
+
+
+def run_sys(system: str, ev, profiles, contexts):
+    """The protected pipeline, or the plaintext twin for PT-S."""
+    if system == "PT-S":
+        from vista_siem.plaintext import PlainTwin
+        pt = PlainTwin(sys_config(system), profiles, contexts)
+        pt.run(ev)
+        return pt
+    return run(sys_config(system), ev, profiles, contexts)
+
+
+# ============================================================================ ML baselines
+def _ml_rows(log, name):
+    return [r for r in log if r[2] == name]
+
+
+def _ml_score(kind: str, m, X):
+    import numpy as np
+    if m is None:
+        return np.zeros(len(X))
+    return -m.score_samples(X) if kind == "ML-IF" else m.predict_proba(X)[:, 1]
+
+
+def ml_fit(kind: str, runs, allowed: int):
+    """Per class: model over (z, h_prev) of the development score logs; Theta at the alert budget
+    (theta_for_budget over benign entities), from in-sample IF scores or out-of-fold GB scores."""
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingClassifier, IsolationForest
+
+    p0, _ = ait_profiles_and_contexts()
+    models, oof = {}, [[] for _ in runs]
+    for p in p0:
+        rows = [(k, r) for k, (log, *_rest) in enumerate(runs) for r in _ml_rows(log, p.name)]
+        if not rows:
+            models[p.name] = None
+            continue
+        X = np.array([list(r[4]) + list(r[5]) for _, r in rows], float)
+        y = np.array([int((r[1], r[2], r[0]) in runs[k][1]) for k, r in rows])
+        g = np.array([k for k, _ in rows])
+        if kind == "ML-IF":
+            m = IsolationForest(n_estimators=200, random_state=0).fit(X)
+            sc = -m.score_samples(X)
+        elif len(set(y)) < 2:
+            m, sc = None, np.zeros(len(y))
+        else:
+            m = GradientBoostingClassifier(random_state=0).fit(X, y)
+            sc = np.zeros(len(y))
+            for k in sorted(set(g)):
+                tr = g != k
+                if len(set(y[tr])) == 2:
+                    sc[g == k] = GradientBoostingClassifier(random_state=0).fit(X[tr], y[tr]).predict_proba(X[g == k])[:, 1]
+                else:
+                    sc[g == k] = m.predict_proba(X[g == k])[:, 1]
+        models[p.name] = m
+        for (k, r), v in zip(rows, sc):
+            oof[k].append((r[0], r[1], r[2], float(v), r[4], r[5]))
+    prof = theta_for_budget([(oof[k], runs[k][2]) for k in range(len(runs))], p0, allowed)
+    return dict(kind=kind, models=models, profiles=p0, theta={p.name: p.Theta for p in prof})
+
+
+def ml_detect(params, s):
+    """ML alerts (user, class, epoch) and scores from an S run's score log."""
+    import numpy as np
+
+    alerts, raw = set(), {}
+    by_a = {}
+    for r in s.ee.score_log:
+        by_a.setdefault(r[2], []).append(r)
+    for a, rows in by_a.items():
+        X = np.array([list(r[4]) + list(r[5]) for r in rows], float)
+        sc = _ml_score(params["kind"], params["models"].get(a), X)
+        for r, v in zip(rows, sc):
+            raw[(r[1], a, r[0])] = float(v)
+            if v >= params["theta"][a]:
+                alerts.add((r[1], a, r[0]))
+    return alerts, raw
+
+
+def detect(system: str, params, ev):
+    """Alerts, unclassified alerts and raw scores of a VistaSIEM-family system or ML baseline."""
+    _, contexts = ait_profiles_and_contexts()
+    if system in ML_SYSTEMS:
+        s = run(sys_config(system), ev, params["profiles"], contexts)
+        alerts, raw = ml_detect(params, s)
+        return alerts, vista_siem_alerts(s)[1], raw
+    s = run_sys(system, ev, params, contexts)
+    alerts, unl = vista_siem_alerts(s)
+    return alerts, unl, vista_siem_scores(s)
+
+
+def w_dev(system: str, profiles, name: str, max_epoch: int | None):
+    ev, truth, n_ep = dev_stream(name, max_epoch)
+    _, contexts = ait_profiles_and_contexts()
+    s = run_sys(system, ev, profiles, contexts)
+    pos = {(gt.user, gt.attack_class, e) for gt in truth for e in gt.epochs}
+    bad = attack_entities(ev)
+    return s.ee.score_log, pos, bad, n_ep
+
+
+def w_test(system: str, params, name: str, max_epoch: int | None):
+    ev, truth, meta = scenario(name, max_epoch)
+    unl = set()
+    if system.startswith("B1"):
+        alerts, raw = rule_alerts(ev, params, EPOCH), rule_scores(ev, params, EPOCH)
+    else:
+        alerts, unl, raw = detect(system, params, ev)
+    scores, per = score_alerts(alerts, truth, CLASSES)
+    return dict(system=system, scenario=name, scores=scores, per=per, tf=threshold_free(raw, truth, CLASSES),
+                kinds={gt.attack_id: gt.attack_class for gt in truth}, events=len(ev),
+                unl_users=len({u for u, _ in unl}))
+
+
+def w_inject(system: str, params, name: str, family: str, rate: int, span: int, max_epoch: int, seed: int):
+    """rate per hour for span hours inside a window of max_epoch hours (= epochs at Delta_e = 1 h)."""
+    ev, _, _ = scenario(name, hours_to_epochs(max_epoch))
+    bg = benign_background(ev)
+    start = max(1, (max_epoch - span) // 2)
+    ev2, gt = inject(bg, family, rate, span, start, seed=seed, epoch_len=HOUR)
+    gt = remap_truth([gt], HOUR, EPOCH)[0]
+    if system.startswith("B1"):
+        alerts, raw = rule_alerts(ev2, params, EPOCH), rule_scores(ev2, params, EPOCH)
+    else:
+        alerts, _, raw = detect(system, params, ev2)
+    sc, per = score_alerts(alerts, [gt], [family])
+    x = sc[family]
+    tf = threshold_free(raw, [gt], [family])[family]
+    return dict(system=system, family=family, rate=rate, span=span, seed=seed, recall=x.recall,
+                false_entities=x.alerted_pairs - x.true_pairs, delay=x.mean_delay, recall_at_fp2=tf["recall_at_fp"],
+                delay_h=None if x.mean_delay is None else x.mean_delay * EPOCH / HOUR, epoch_len=EPOCH)
+
+
+def w_leak(name_sys: str, scen: str, max_epoch: int | None):
+    from vista_siem.data.ait import load_scenario as _ls  # noqa: F401
+
+    variant, persistent = {"A4": ("S", True), "SD+A4": ("SD", True)}.get(name_sys, (name_sys, False))
+    ev, _, _ = scenario(scen, max_epoch)
+    day = 24 * HOUR
+    aux, target = [e for e in ev if e.ts < day], [e for e in ev if e.ts >= day]
+    _, contexts = ait_profiles_and_contexts()
+    extra = {"gamma": FP_GAMMA} if variant == "FP" else {}
+    s = run(config(variant, persistent_tokens=persistent, **extra), target, None, contexts)
+    out = dict(system=name_sys, scenario=scen, decoy_ratio=s.ee.stats["decoy"] / max(s.ee.stats["real"], 1))
+    for dim in ("U", "R"):
+        r = frequency_attack(s, aux_distribution(aux, dim), dim, cumulative=persistent)
+        out[f"{dim}_token_recovery"], out[f"{dim}_volume_recovery"] = r["token_recovery"], r["volume_recovery"]
+    d = decoy_distinguisher(s)
+    lk = linkage_attack(s)
+    out.update(decoy_auc=d["auc"], linkage_accuracy=lk["linkage_accuracy"], linkage_chance=lk["chance"])
+    return out
+
+
+# ============================================================================ calibration
+def calibrate_all(ex, systems, max_epoch):
+    p0, _ = ait_profiles_and_contexts()
+    profiles = {sy: p0 for sy in systems}
+    days = None
+    for step in ("learn", "theta", "theta"):
+        jobs = [(sy, profiles[sy], sc, max_epoch) for sy in systems for sc in DEV]
+        res = list(ex.map(w_dev, *zip(*jobs)))
+        by_sys = defaultdict(list)
+        for (sy, *_), r in zip(jobs, res):
+            by_sys[sy].append(r)
+        for sy in systems:
+            runs = by_sys[sy]
+            if step == "learn":
+                profiles[sy] = fit_weights([(log, pos) for log, pos, _, _ in runs], profiles[sy],
+                                           history=config(sy).history)
+            else:
+                days = sum(n for *_, n in runs) * EPOCH / 86400
+                allowed = math.floor(ALERTS_PER_DAY * days)
+                profiles[sy] = theta_for_budget([(log, bad) for log, _, bad, _ in runs], profiles[sy], allowed)
+        print(f"  calibration step {step} done", flush=True)
+    return profiles
+
+
+def calibrate_ml(ex, systems, max_epoch):
+    """ML-IF / ML-GB: features from S runs with the default profiles on the development scenarios."""
+    if not systems:
+        return {}
+    p0, _ = ait_profiles_and_contexts()
+    runs = list(ex.map(w_dev, ["S"] * len(DEV), [p0] * len(DEV), DEV, [max_epoch] * len(DEV)))
+    days = sum(n for *_, n in runs) * EPOCH / 86400
+    allowed = math.floor(ALERTS_PER_DAY * days)
+    out = {sy: ml_fit(sy, runs, allowed) for sy in systems}
+    print("  ML baselines fitted", flush=True)
+    return out
+
+
+def rules(max_epoch):
+    p, _ = ait_profiles_and_contexts()
+    default = [FreqRule(x.name, x.categories, 14 if x.name == "recon" else 8, 90.0 if x.name == "recon" else 120.0)
+               for x in p]
+    # tuned: one-hour window, smallest frequency within the same alert budget on development data
+    devs = [dev_stream(sc, max_epoch) for sc in DEV]
+    allowed = math.floor(ALERTS_PER_DAY * sum(n for *_, n in devs) * EPOCH / 86400)
+    bad = [attack_entities(ev) for ev, _, _ in devs]
+    tuned = []
+    for r in default:
+        f = 2
+        while True:
+            rr = replace(r, frequency=f, timeframe=EPOCH)
+            n = sum(len({a for a in rule_alerts(ev, [rr], EPOCH) if a[0] not in b})
+                    for (ev, _, _), b in zip(devs, bad))
+            if n <= allowed:
+                break
+            f += 1
+        tuned.append(rr)
+    return default, tuned
+
+
+# ============================================================================ main
+def main() -> None:
+    global DATA, DEV, TEST, SYSTEMS, LEAK_SYSTEMS, FP_GAMMA, EPOCH
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--parts", default="e1,e3,e2")
+    ap.add_argument("--quick", action="store_true", help="first 24 epochs, 1 test scenario, few rates")
+    ap.add_argument("--workers", type=int, default=8, help="workers for windowed jobs (injection sweep)")
+    ap.add_argument("--inject-seeds", type=int, default=5, help="repetitions of the injection sweep (E1-B)")
+    ap.add_argument("--heavy-workers", type=int, default=3,
+                    help="workers for full-scenario jobs; each needs up to ~10 GB (32 GB VM: 3)")
+    ap.add_argument("--data", default=str(DATA))
+    ap.add_argument("--dev", default=",".join(DEV), help="development scenarios (comma separated)")
+    ap.add_argument("--test", default=",".join(TEST), help="test scenarios (comma separated)")
+    ap.add_argument("--systems", default=",".join(SYSTEMS), help="VistaSIEM systems for e1")
+    ap.add_argument("--rules", default="B1-default,B1-tuned", help="rule baselines for e1 ('' for none)")
+    ap.add_argument("--leak-systems", default=",".join(LEAK_SYSTEMS), help="systems for e3")
+    ap.add_argument("--fp-gamma", type=float, default=FP_GAMMA, help="gamma of the FP system")
+    ap.add_argument("--tag", default="", help="output files ait_<tag>_*")
+    ap.add_argument("--epoch-len", type=float, default=EPOCH, help="Delta_e in seconds (multiple of 300)")
+    args = ap.parse_args()
+    EPOCH = args.epoch_len
+    os.environ["VISTA_EPOCH_LEN"] = str(EPOCH)
+    SYSTEMS, LEAK_SYSTEMS, FP_GAMMA = args.systems.split(","), args.leak_systems.split(","), args.fp_gamma
+    os.environ["VISTA_FP_GAMMA"] = str(FP_GAMMA)
+    rule_systems = [r for r in args.rules.split(",") if r]
+    pre = f"ait_{args.tag}_" if args.tag else "ait_"
+    DEV, TEST = args.dev.split(","), args.test.split(",")
+    if set(DEV) & set(TEST):
+        print(f"WARNING: scenarios in both development and test: {set(DEV) & set(TEST)} (smoke test only)")
+    DATA = Path(args.data).expanduser()
+    parts = set(args.parts.split(","))
+    max_ep = hours_to_epochs(24) if args.quick else None
+    tests = TEST[:1] if args.quick else TEST
+    t0 = time.time()
+    md = [f"# AIT-LDSv2 results ({platform.node()}, {platform.platform()})\n",
+          f"Development: {', '.join(DEV)}; test: {', '.join(tests)}; "
+          f"{'first 24 hours only (quick)' if args.quick else 'full scenarios'}; "
+          f"alert budget {ALERTS_PER_DAY} benign alerts per class per day; Delta_e = {EPOCH:.0f} s.\n"]
+    missing = [s for s in DEV + tests if not (DATA / s / "dataset.yaml").exists()]
+    if missing:
+        sys.exit(f"missing scenarios {missing}: run tools/ait_fetch.py first")
+    for sc in DEV + tests:  # build the event caches once, before the workers start
+        load_scenario(DATA / sc, EPOCH)
+
+    heavy = args.workers if args.quick else args.heavy_workers
+    with ProcessPoolExecutor(heavy) as ex, ProcessPoolExecutor(args.workers) as light:
+        if "e1" in parts:
+            prof = calibrate_all(ex, [sy for sy in SYSTEMS if sy not in ML_SYSTEMS + ("PT-S",)], max_ep)
+            if "PT-S" in SYSTEMS:  # S's learned weights and thresholds, applied to plaintext features
+                prof["PT-S"] = prof["S"] if "S" in prof else calibrate_all(ex, ["S"], max_ep)["S"]
+            prof.update(calibrate_ml(ex, [sy for sy in SYSTEMS if sy in ML_SYSTEMS], max_ep))
+            b1d, b1t = rules(max_ep) if rule_systems else (None, None)
+            params = {**prof, "B1-default": b1d, "B1-tuned": b1t}
+            systems = SYSTEMS + rule_systems
+            print(f"calibrated in {time.time() - t0:.0f}s", flush=True)
+
+            jobs = [(sy, params[sy], sc, max_ep) for sy in systems for sc in tests]
+            resA = list(ex.map(w_test, *zip(*jobs)))
+            rows, inc = [], []
+            for r in resA:
+                for c, x in r["scores"].items():
+                    rows.append(dict(system=r["system"], scenario=r["scenario"], attack_class=c, incidents=x.incidents,
+                                     detected=x.detected, false_entities=x.alerted_pairs - x.true_pairs,
+                                     precision=x.precision, recall=x.recall, f1=x.f1, delay=x.mean_delay,
+                                     delay_h=None if x.mean_delay is None else x.mean_delay * EPOCH / HOUR,
+                                     epoch_len=EPOCH,
+                                     auc=r["tf"][c]["auc"], recall_at_fp2=r["tf"][c]["recall_at_fp"]))
+                for aid, (d, delay) in r["per"].items():
+                    inc.append(dict(system=r["system"], scenario=r["scenario"], incident=aid,
+                                    attack_class=r["kinds"][aid], detected=d, delay=delay))
+            write_csv(f"{pre}e1_main.csv", rows)
+            write_csv(f"{pre}e1_incidents.csv", inc)
+            md += ["## E1-A: real attack chains (pooled over test scenarios)\n",
+                   "| System | Class | Incidents | Detected | False entities | AUC | Recall@FP2 |",
+                   "|---|---|---|---|---|---|---|"]
+            for sy in systems:
+                for c in CLASSES:
+                    sel = [x for x in rows if x["system"] == sy and x["attack_class"] == c]
+                    md.append(f"| {sy} | {c} | {sum(x['incidents'] for x in sel)} | {sum(x['detected'] for x in sel)} | "
+                              f"{sum(x['false_entities'] for x in sel)} | {mean_sd([x['auc'] for x in sel])} | "
+                              f"{mean_sd([x['recall_at_fp2'] for x in sel])} |")
+            print(f"E1-A done in {time.time() - t0:.0f}s", flush=True)
+
+            rates = [2, 8, 32] if args.quick else [1, 2, 4, 8, 16, 32]
+            spans = [6] if args.quick else [6, 24]
+            seeds = [1] if args.quick else list(range(1, args.inject_seeds + 1))
+            win = 24 if args.quick else 36
+            sys_b = [sy for sy in systems if sy != "B2"]  # without decoys, B2 detects exactly like S
+            # seed k injects into test scenario k (cycling), so repetitions vary the real background too
+            jobsB = [(sy, params[sy], tests[(sd - 1) % len(tests)], fam, r, sp, win, sd) for sy in sys_b
+                     for fam in sorted(INJECT_FAMILIES) for r in rates for sp in spans for sd in seeds if sp < win]
+            resB = list(light.map(w_inject, *zip(*jobsB)))
+            write_csv(f"{pre}e1_inject.csv", resB)
+            for key, title in (("recall", "recall at the calibrated threshold"),
+                               ("false_entities", "falsely alerted benign entities"),
+                               ("recall_at_fp2", "recall@FP2 (threshold-free)")):
+                md += ["", f"## E1-B: injected low-and-slow attacks on {tests[0]} background, {title}\n"]
+                for fam in sorted(INJECT_FAMILIES):
+                    for sp in spans:
+                        md += [f"\n{fam}, span {sp} epochs\n", "| System | " + " | ".join(f"r={r}" for r in rates) + " |",
+                               "|---|" + "---|" * len(rates)]
+                        for sy in sys_b:
+                            cells = []
+                            for r in rates:
+                                sel = [x for x in resB if x["system"] == sy and x["family"] == fam
+                                       and x["rate"] == r and x["span"] == sp]
+                                cells.append(f"{statistics.mean(x[key] for x in sel):.2f}" if sel else "-")
+                            md.append(f"| {sy} | " + " | ".join(cells) + " |")
+            print(f"E1-B done in {time.time() - t0:.0f}s", flush=True)
+
+        if "e3" in parts:
+            jobs = [(n, sc, max_ep if max_ep is None else hours_to_epochs(48)) for n in LEAK_SYSTEMS for sc in tests]
+            res = list(ex.map(w_leak, *zip(*jobs)))
+            write_csv(f"{pre}e3_leakage.csv", res)
+            cols = [("decoy_ratio", "δ"), ("U_token_recovery", "U tokens"), ("U_volume_recovery", "U volume"),
+                    ("R_token_recovery", "R tokens"), ("R_volume_recovery", "R volume"), ("decoy_auc", "Decoy AUC"),
+                    ("linkage_accuracy", "Linkage"), ("linkage_chance", "Chance")]
+            md += ["", "## E3: leakage on days 2-4 (prior: day 1 of the same scenario)\n",
+                   "| System | " + " | ".join(c[1] for c in cols) + " |", "|---|" + "---|" * len(cols)]
+            for n in LEAK_SYSTEMS:
+                sel = [r for r in res if r["system"] == n]
+                md.append(f"| {n} | " + " | ".join(mean_sd([r[k] for r in sel]) for k, _ in cols) + " |")
+            print(f"E3 done in {time.time() - t0:.0f}s", flush=True)
+
+    if "e2" in parts:
+        ev, _, _ = scenario(tests[0], 6 if args.quick else 24)
+        _, contexts = ait_profiles_and_contexts()
+        rows = []
+        for v in ("S", "SD", "B3"):
+            cfg = config(v, paillier_bits=2048, precompute_workers=args.workers)
+            t1 = time.time()
+            s = run(cfg, ev, None, contexts)
+            wall = time.time() - t1
+            st = s.ee.stats
+            rows.append(dict(system=v, events=len(ev), decoy_ratio=st["decoy"] / st["real"], wall_s=wall,
+                             online_s=st["t_online"], offline_s=st["t_offline"],
+                             online_ev_per_s=len(ev) / st["t_online"], sustained_ev_per_s=len(ev) / wall,
+                             bytes_per_event=s.bus.total("ee", "cloud") / len(ev), ka_decryptions=s.ka.decryptions,
+                             phase3_s=s.timing["phase3"], phase4_s=s.timing["phase4"], phase5_s=s.timing["phase5"]))
+            print(f"  E2 {v}: {rows[-1]}", flush=True)
+        write_csv(f"{pre}e2_throughput.csv", rows)
+        md += ["", f"## E2: 2048-bit throughput on {tests[0]} ({rows[0]['events']:,} events, {args.workers} workers)\n",
+               "| System | δ | Online ev/s | Sustained ev/s | Offline s | Bytes / event | Phase 3+4+5 s |",
+               "|---|---|---|---|---|---|---|"]
+        md += [f"| {r['system']} | {r['decoy_ratio']:.2f} | {r['online_ev_per_s']:,.0f} | {r['sustained_ev_per_s']:,.1f} | "
+               f"{r['offline_s']:.0f} | {r['bytes_per_event']:,.0f} | {r['phase3_s'] + r['phase4_s'] + r['phase5_s']:.2f} |"
+               for r in rows]
+
+    md.append(f"\nTotal time {time.time() - t0:.0f}s")
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    (RESULTS / f"{pre}summary.md").write_text("\n".join(md) + "\n")
+    print("\n".join(md))
+
+
+if __name__ == "__main__":
+    main()

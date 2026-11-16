@@ -1,0 +1,906 @@
+"""Edge Encryptor (EE): the trusted component that sees plaintext.
+
+Phase 1  normalization is done by the loaders; here: tokens (eq:tokens), AES-GCM payloads
+         (eq:aes-gcm), HE features (eq:he), realness indicator (eq:realness-indicator),
+         frequency-hiding decoy padding (eq:tier, eq:padding-deficit, eq:decoy-count), or the
+         journal's LAPH (vista_siem/laph.py) and fixed padding over real values.
+Phase 2  index entries (eq:index-entry), MMR commitment (eq:mmr-leaf), authenticated EPII root
+         and checkpoints CP_e = (e, R^MMR, R^IDX, H(CP_{e-1}), n_e) (journal eq:checkpoint),
+         TD registration (eq:token-mapping).
+Phase 3  protected queries (eq:protected-query); with cfg.acl, verify-before-release ACL
+         (journal Algorithm alg:acl) before the KA release.
+Phase 4  with cfg.acl, graph-lineage verification of the cloud's updates (C_G).
+Phase 5  trusted history, adaptive retention, scoring, alerts (eq:adaptive-decay ...
+         eq:alert-descriptor); state commitments C_H with cfg.acl; label-free screening
+         (eq:sketch-keys ... eq:unlabeled-alert).
+Phase 6  historical token derivation (eq:historical-entity-token, eq:investigation-query).
+
+Journal r1 (second pre-submission review):
+- the AQRS partition of each epoch is outsourced encrypted under K_e^Pt and bound in the checkpoint
+  as H(P~_e) (CP_e gains a sixth field), so historical cohorts can be rebuilt (end_epoch,
+  _hist_groups);
+- cfg.aqrs_verify == "all": every cohort member is verified alike and any failure rejects the
+  whole cohort (hunt, _acl_check);
+- aggregates of a finalized older epoch are recomputed over records the cloud returns with an MMR
+  multiproof against the signed R_tau^MMR (_ctx), so the EE needs no history of its own;
+- cfg.inv_cohort: investigation queries are issued for the alerted entity's whole group
+  (investigation_cohort).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import statistics
+import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field, replace
+
+from .. import lineage
+from ..aqrs import AQRS, Spec
+from ..bus import Bus
+from ..crypto.cms import CountMin
+from ..crypto.encoding import FixedPoint, encode
+from ..crypto.mmr import MMR
+from ..crypto.mmr import HashCounter, leaf_hash, multiverify
+from ..crypto.paillier import ZERO, Paillier
+from ..crypto.primitives import H, AeadError, aead_decrypt, aead_encrypt, prf_token, verify
+from ..laph import ExposureTracker, plan_cohort, plan_decoys
+from ..model import GRAPH_FEATURES, AttackProfile, Config, Context, Event, Policy
+from ..protocol import DIMS, IndexEntry, ProtectedRecord, aead_ad, leaf_data
+from .ka import GENESIS, KeyAuthority
+from .td import TokenDirectory
+
+
+def tier(c: int, gamma: float) -> int:
+    """Tier_gamma(c) = min{ceil(gamma^k) : k in N_0, ceil(gamma^k) >= c}, c >= 1 (eq:tier)."""
+    if c < 1:
+        raise ValueError("tier defined for c >= 1")
+    k, v = 0, 1
+    while v < c:
+        k += 1
+        v = math.ceil(gamma**k)
+    return v
+
+
+def _sigmoid(x: float) -> float:
+    """Logistic function, stable for any magnitude of x (math.exp overflows past ~709)."""
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    ex = math.exp(x)
+    return ex / (1.0 + ex)
+
+
+@dataclass
+class Descriptor:
+    """Desc_{u,a}^(e) = (e, T_u, a, S, ell, Prov), eq:alert-descriptor; a=None for
+    unclassified alerts (eq:unlabeled-alert-descriptor)."""
+
+    epoch: int
+    token: bytes
+    attack: str | None
+    score: float
+    horizon: int | None
+    provenance: frozenset
+    state_commitment: bytes | None = None  # C_H with cfg.acl
+
+
+@dataclass
+class _Pending:
+    tokens: tuple[bytes, bytes, bytes, bytes]
+    feats: dict
+    payload: bytes
+    delta: int
+    user: str | None
+
+
+@dataclass
+class _PairState:
+    h: list[float]
+    R: float = 0.0
+    prov: set = field(default_factory=set)
+    C_H: bytes = GENESIS
+    zs: list = field(default_factory=list)  # NoContract: explicit (epoch, z) history
+    win: list = field(default_factory=list)  # Fixed-Window: (epoch, z) of the last W epochs
+    born: int = 1                           # profile version the lineage started under
+
+
+class EdgeEncryptor:
+    def __init__(self, cfg: Config, ka: KeyAuthority, td: TokenDirectory, bus: Bus,
+                 profiles: dict[str, AttackProfile], contexts: list[Context]):
+        if cfg.epoch_len % cfg.bucket_len:
+            raise ValueError("epoch_len must be a multiple of bucket_len")
+        self.cfg, self.ka, self.td, self.bus = cfg, ka, td, bus
+        self.profiles, self.contexts = profiles, contexts
+        self.cloud = None  # wired by the system
+        self.sa = None
+        self.he = Paillier(ka.pk_h)
+        self.fp = FixedPoint(int(ka.pk_h.n), cfg.frac_bits)
+        self.rng = random.Random(cfg.seed) if cfg.seed is not None else random.SystemRandom()
+        # per-epoch state
+        self.epoch: int | None = None
+        self.keys: dict[str, bytes] = {}
+        self.mmr: MMR | None = None
+        self.prev_cp_hash = GENESIS
+        self.checkpoint: tuple | None = None
+        self.epoch_entries: dict[int, IndexEntry] = {}  # iota -> entry, current epoch
+        self.epoch_X: dict[int, tuple] = {}             # iota -> (X, X0), current epoch (cfg.acl)
+        self.accepted: dict[str, dict] = {}             # qid -> accepted Phase 3 evidence (cfg.acl)
+        self.mu_prev = None
+        self.exposure = ExposureTracker(cfg) if cfg.padding == "laph" else None
+        self._epoch_scope = cfg.padding == "cohort" or cfg.laph_scope == "epoch" and (
+            cfg.padding == "laph" or (cfg.padding == "fixed" and cfg.gamma > 1))
+        self.epoch_events: list[Event] = []    # epoch-scoped padding holds the epoch here
+        self._queued: list[_Pending] = []      # decoys planned for the bucket being closed
+        if cfg.acl and cfg.full_he:
+            raise ValueError("ACL is defined for SG-HEF, not for the full-HE baseline")
+        self._tok_cache: dict[tuple[int, str, str], bytes] = {}
+        self.user_of: dict[int, dict[bytes, str]] = defaultdict(dict)  # epoch -> T_U -> u
+        self.dummy: dict[int, set[bytes]] = defaultdict(set)
+        # bucket state
+        self.bucket: int | None = None
+        self.bucket_events: list[Event] = []
+        # Phase 5 state, keyed by (user, attack)
+        self.state: dict[tuple, _PairState] = {}  # (u, a, pid_a); (u, a) under No-Profile-Bind
+        self.alert_log: list[dict] = []
+        # screening state
+        self.cms_cur = CountMin.for_error(cfg.cms_eps, cfg.cms_delta)
+        self.cms_base = self.cms_cur.like()
+        self.buckets_seen = 0
+        self.chi2_threshold = statistics.NormalDist().inv_cdf(1 - cfg.alpha_fp / 2) ** 2
+        # statistics for experiments (t_offline / t_online in seconds)
+        self.stats = Counter()
+        # evaluation-only ground truth; no protocol step reads these
+        self.score_log: list[tuple] = []  # (epoch, user, attack, S, z, h^(e-1))
+        self.decoy_rids: set[tuple[int, int]] = set()
+        self._mu_clean = None                  # epoch profile over real records (graph_real_only)
+        self.horizon_log: list[tuple] = []  # (epoch, user, attack, ell, lambda)
+        self.acl_log: list[dict] = []       # per verification: kind, ok, seconds, hashes, he_adds
+        # journal v3 spot-check ACL: own generator, drawn only when cfg.acl_sample < 1, so the default
+        # run consumes exactly the random numbers it did before
+        self._acl_rng = random.Random(None if cfg.seed is None else cfg.seed + 104723)
+        # journal v2: AQRS for hunting queries
+        self.aqrs = AQRS(cfg, random.Random(None if cfg.seed is None else cfg.seed + 7919))
+        self.epoch_tuples = Counter()       # plaintext (u, r, c, s) -> count, current epoch
+        self.hunt_log: list[dict] = []      # evaluation only: the real member of every cohort
+        self._hunt_n = 0
+
+    # ================================================================ helpers
+    def token(self, dim: str, value: str, epoch: int | None = None,
+              keys: dict[str, bytes] | None = None) -> bytes:
+        e = self.epoch if epoch is None else epoch
+        ck = (e, dim, value)
+        if ck not in self._tok_cache:
+            self._tok_cache[ck] = prf_token((keys or self.keys)[dim], value)
+            self.stats["prf"] += 1
+        return self._tok_cache[ck]
+
+    def precompute(self, n: int) -> None:
+        """Offline phase: precompute Paillier randomizers (timed separately)."""
+        t0 = time.perf_counter()
+        self.he.precompute(n, self.cfg.precompute_workers)
+        self.stats["t_offline"] += time.perf_counter() - t0
+
+    # ================================================================ Phase 1/2: epochs and ingestion
+    def start_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        self.epoch_start = (epoch - 1) * self.cfg.epoch_len
+        self.keys = self.bus.send("ka", "ee", "epoch_keys", self.ka.epoch_keys(epoch))
+        self.mmr = MMR()
+        self.epoch_entries, self.epoch_X, self.accepted = {}, {}, {}
+        if self.epoch_tuples:
+            self.aqrs.end_epoch()
+        self.epoch_tuples = Counter()
+
+    def ingest(self, ev: Event) -> None:
+        if self._epoch_scope:
+            self.epoch_events.append(ev)
+            return
+        self._ingest_bucketed(ev)
+
+    def _ingest_bucketed(self, ev: Event) -> None:
+        b = int(ev.ts // self.cfg.bucket_len)
+        if self.bucket is not None and b != self.bucket:
+            self.close_bucket()
+        self.bucket = b
+        self.bucket_events.append(ev)
+        self.epoch_tuples[(ev.user, ev.res, ev.cat, ev.src)] += 1
+        if self.cfg.screening:
+            self.cms_cur.update(H(ev.user.encode()))
+            self.cms_cur.update(H(encode(ev.user, ev.res, ev.cat)))
+
+    def _plan(self, events: list[Event]) -> list[tuple]:
+        """Decoy plan over real values: LAPH (cfg.padding == "laph") or fixed padding ("fixed")."""
+        if self.cfg.padding == "cohort":  # D29: pad each AQRS group to its maximum
+            real = Counter((ev.user, ev.res, ev.cat, ev.src) for ev in events)
+            groups = self.aqrs.partition(real, keep=True)
+            live = {"U": {ev.user for ev in events}, "R": {ev.res for ev in events}}
+            # quiet values (volume 0, ranked last) are not padded: a decoy copies a real relation
+            groups = {d: [g for g in (tuple(v for v in g if v in live[d[0]]) for g in gs) if g]
+                      for d, gs in groups.items()}
+            if self.cfg.cpad_mode == "entity_cat":
+                return plan_cohort(events, groups, True, self.rng, per_cat=True)
+            return plan_cohort(events, groups, self.cfg.cpad_cats, self.rng)
+        if self.cfg.padding == "laph":
+            gamma_of = {k: self.exposure.gamma(L) for k, L in self.exposure.scores(events).items()}
+        else:
+            gamma_of = {(d, v): self.cfg.gamma for ev in events for d, v in (("U", ev.user), ("R", ev.res))}
+        return plan_decoys(events, gamma_of, self.rng)
+
+    def _pending_decoy(self, u, r, c, s, n: int) -> _Pending:
+        """A decoy over real values; n = payload length of the real event it was copied from."""
+        toks = tuple(self.token(d, v) for d, v in zip(DIMS, (u, r, c, s)))
+        self.epoch_tuples[(u, r, c, s)] += 1  # AQRS plans on the cloud-visible volumes
+        return _Pending(toks, {}, self.rng.randbytes(n) if hasattr(self.rng, "randbytes") else bytes(n), 1, None)
+
+    def _real_value_decoys(self, events: list[Event], real_lengths: list[int]) -> list[_Pending]:
+        return [self._pending_decoy(u, r, c, s, n) for u, r, c, s, _, n in self._plan(events)]
+
+    def _flush_epoch(self) -> None:
+        """Epoch-scoped padding (D26): plan decoys on epoch counts and water-fill each entity's
+        decoys into the epoch's buckets (always the bucket where that entity's count is lowest),
+        so padded entities of one tier get the same total and a flat bucket profile; then process
+        the epoch bucket by bucket as usual."""
+        events, self.epoch_events = sorted(self.epoch_events, key=lambda x: x.ts), []
+        if not events:
+            return
+        by_b = defaultdict(list)
+        for ev in events:
+            by_b[int(ev.ts // self.cfg.bucket_len)].append(ev)
+        first = int(self.epoch_start // self.cfg.bucket_len)
+        buckets = list(range(first, first + int(self.cfg.epoch_len // self.cfg.bucket_len)))
+        load = defaultdict(Counter)  # user -> bucket -> records so far
+        for ev in events:
+            load[ev.user][int(ev.ts // self.cfg.bucket_len)] += 1
+        planned = defaultdict(list)
+        for u, r, c, s, _, n in self._plan(events):
+            lo = min(load[u][b] for b in buckets)
+            b = self.rng.choice([b for b in buckets if load[u][b] == lo])
+            load[u][b] += 1
+            planned[b].append(self._pending_decoy(u, r, c, s, n))
+        for b in sorted(set(by_b) | set(planned)):
+            self._queued = planned.pop(b, [])
+            self.bucket = b
+            for ev in by_b.get(b, []):
+                self._ingest_bucketed(ev)
+            self.close_bucket()
+        self.bucket = None
+
+    def _decoys(self, real_tokens: list[tuple], real_lengths: list[int]) -> list[_Pending]:
+        """Frequency-hiding padding for one bucket (Phase 1, Step 5)."""
+        if self._epoch_scope:
+            out, self._queued = self._queued, []
+            return out
+        if self.cfg.padding == "laph" or (self.cfg.padding == "fixed" and self.cfg.gamma > 1):
+            return self._real_value_decoys(self.bucket_events, real_lengths) if real_tokens else []
+        g = self.cfg.gamma
+        if g <= 1 or not real_tokens:
+            return []
+        n_real = len(real_tokens)
+        lists = {}
+        need = 0
+        for di, dim in ((0, "U"), (1, "R")):
+            counts = Counter(t[di] for t in real_tokens)
+            zeta = {T: tier(c, g) - c for T, c in counts.items()}
+            lists[dim] = [T for T, z in zeta.items() for _ in range(z)]
+            need = max(need, len(lists[dim]))
+        n_dec = tier(n_real + need, g) - n_real
+        for dim in ("U", "R"):
+            lst = lists[dim]
+            for j in range(n_dec - len(lst)):
+                t = prf_token(self.keys[dim], encode("dum", self.bucket, j))  # eq:dummy-token
+                self.stats["prf"] += 1
+                self.dummy[self.epoch].add(t)
+                lst.append(t)
+            self.rng.shuffle(lst)
+        out = []
+        for k in range(n_dec):
+            _, _, tc, ts = self.rng.choice(real_tokens)  # real (category, source) pair
+            out.append(_Pending((lists["U"][k], lists["R"][k], tc, ts), {},
+                                self.rng.randbytes(self.rng.choice(real_lengths))
+                                if hasattr(self.rng, "randbytes") else bytes(self.rng.choice(real_lengths)),
+                                1, None))
+        return out
+
+    def _he_per_record(self) -> int:
+        F = len(self.cfg.agg_features)
+        return len(self.contexts) * (F + 1) + 1 if self.cfg.full_he else F + 1
+
+    def _full_he_features(self, p: _Pending) -> tuple:
+        """B3 (full-HE baseline): for every context q, Enc(w * x_f * m_q) for each feature f and
+        Enc((1 - delta) * m_q), where m_q = 1 if the record satisfies q's predicates and w is the
+        source weight (1 if q has none). Laid out as slot q * (|J_AGG| + 1) + j."""
+        out = []
+        for c in self.contexts:
+            m = 1
+            for di, vals in enumerate((c.users, c.resources, c.categories, c.sources)):
+                if vals and p.tokens[di] not in {self.token(DIMS[di], v) for v in vals}:
+                    m = 0
+                    break
+            w = 1
+            if c.source_weights:
+                w = {self.token("S", s): wt for s, wt in c.source_weights.items()}.get(p.tokens[3], 0)
+            for f in self.cfg.agg_features:
+                out.append(self.he.encrypt(self.fp.encode(p.feats.get(f, 0)) * w * m))
+            out.append(self.he.encrypt((1 - p.delta) * m))
+        return tuple(out)
+
+    def close_bucket(self) -> None:
+        if not self.bucket_events and not (self._epoch_scope and self._queued):
+            return
+        e, b = self.epoch, self.bucket
+        real = [
+            _Pending(tuple(self.token(d, v) for d, v in zip(DIMS, (ev.user, ev.res, ev.cat, ev.src))),
+                     ev.feats, ev.payload, 0, ev.user)
+            for ev in self.bucket_events
+        ]
+        decoys = self._decoys([p.tokens for p in real], [len(p.payload) for p in real])
+        self.stats["real"] += len(real)
+        self.stats["decoy"] += len(decoys)
+        batch = real + decoys
+        self.rng.shuffle(batch)  # pi_b: uniformly random permutation
+
+        if self.cfg.precompute_workers > 0:
+            self.precompute(len(batch) * self._he_per_record() - self.he.pool_size())
+
+        t0 = time.perf_counter()
+        flagged_refs: dict[str, set] = defaultdict(set)
+        for p in batch:
+            iota = self.mmr.size
+            iv, ct = aead_encrypt(self.keys["P"], bytes([p.delta]) + p.payload, aead_ad(e, b))
+            if self.cfg.full_he:
+                X = self._full_he_features(p)
+            else:
+                X = tuple(self.he.encrypt(self.fp.encode(p.feats.get(f, 0))) for f in self.cfg.agg_features)
+            X0 = self.he.encrypt(1 - p.delta)
+            self.stats["he_enc"] += len(X) + 1
+            rec = ProtectedRecord(e, iota, iv, ct, X, X0)
+            entry = IndexEntry(p.tokens, b, e, iota)
+            self.mmr.append(leaf_data(rec, entry))
+            self.epoch_entries[iota] = entry
+            if self.cfg.acl:
+                self.epoch_X[iota] = (X, X0)
+            self.bus.send("ee", "cloud", "record", (rec, entry))
+            self.cloud.receive_record(rec, entry)
+            if p.user is not None:
+                self.user_of[e][p.tokens[0]] = p.user
+                flagged_refs[p.user].add(rec.rid)
+            else:
+                self.decoy_rids.add(rec.rid)
+        for T, u in {(p.tokens[0], p.user) for p in real}:
+            self.bus.send("ee", "td", "register", (e, T))
+            self.td.register(e, T, u)
+        self.stats["t_online"] += time.perf_counter() - t0
+        if self.cfg.screening:
+            self._screen(flagged_refs)
+        self.bucket_events = []
+
+    def end_epoch(self) -> tuple[tuple, bytes]:
+        if self._epoch_scope:
+            self._flush_epoch()
+        self.close_bucket()
+        self.bucket = None
+        if self.exposure is not None:
+            self.exposure.end_epoch()
+        t0 = time.perf_counter()
+        r_idx = lineage.build_index(self.epoch_entries.values()).root()  # R_e^IDX (eq:index-root)
+        self.stats["t_index"] += time.perf_counter() - t0
+        # journal r1: the partition is fixed before the checkpoint, outsourced encrypted, and bound in CP_e
+        self.aqrs.start_epoch(self.epoch_tuples)
+        part = self._partition_blob()
+        cp = (self.epoch, self.mmr.root(), r_idx, self.prev_cp_hash, self.mmr.size, H(part[0] + part[1]))
+        sig = self.ka.sign_checkpoint(cp)
+        self.bus.send("ka", "ee", "checkpoint_sig", sig)
+        self.bus.send("ee", "cloud", "checkpoint", (cp, sig))
+        self.cloud.receive_checkpoint(cp, sig)
+        self.bus.send("ee", "cloud", "partition", part)
+        self.cloud.receive_partition(self.epoch, part)
+        self.prev_cp_hash = lineage.checkpoint_hash(cp)
+        self.checkpoint = cp
+        return cp, sig
+
+    def _partition_blob(self) -> tuple[bytes, bytes]:
+        """P~_e: the epoch's AQRS groups (dimension, group, sub-group) encrypted under K_e^Pt."""
+        rows = sorted({(d, g, sub) for (d, _), (g, sub) in self.aqrs.groups.items()})
+        pt = json.dumps([[d, list(g), list(sub)] for d, g, sub in rows]).encode()
+        return aead_encrypt(self.keys["Pt"], pt, encode("partition", self.epoch))
+
+    def _verified_cp(self, tau: int) -> tuple | None:
+        """A finalized epoch's checkpoint as stored by the cloud, accepted only under the KA signature."""
+        if tau == self.epoch:
+            return self.checkpoint
+        cp, sig = self.bus.send("cloud", "ee", "checkpoint", self.cloud.checkpoints[tau])
+        ok = cp[0] == tau and len(cp) > 5 and verify(self.ka.pk_ka, H(encode(*cp)), sig)
+        return cp if ok else None
+
+    def _hist_groups(self, tau: int, keys: dict[str, bytes], cp: tuple | None) -> dict | None:
+        """(dim, value) -> (group, sub-group) of epoch tau, from P~_tau checked against CP_tau."""
+        if tau == self.epoch:
+            return self.aqrs.groups
+        if cp is None:
+            return None
+        iv, ct = self.cloud.partition(tau)
+        if H(iv + ct) != cp[5]:
+            return None
+        try:
+            rows = json.loads(aead_decrypt(keys["Pt"], iv, ct, encode("partition", tau)))
+        except AeadError:
+            return None
+        return {(d, v): (tuple(g), tuple(sub)) for d, g, sub in rows for v in sub}
+
+    def _ctx(self, epoch: int):
+        """(checkpoint, fetch) for verifying a Phase 3 request of `epoch`. fetch(Q) returns the HE
+        ciphertexts and index entries of the candidates, or None if they cannot be authenticated: the
+        EE's own ingestion ciphertexts for the epoch being finalized, otherwise the records the cloud
+        returns with an MMR multiproof checked against the signed R_tau^MMR."""
+        if epoch == self.epoch:
+            return self.checkpoint, lambda Q, hc: (self.epoch_X, self.epoch_entries)
+        cp = self._verified_cp(epoch)
+
+        def fetch(Q, hc):
+            if cp is None:
+                return None
+            if not Q:
+                return {}, {}
+            pkg = self.cloud.records_proof(epoch, Q)
+            recs = pkg["records"]
+            leaves = {i: leaf_hash(leaf_data(rec, ent), hc) for i, (rec, ent) in recs.items()}
+            if set(leaves) != set(Q) or not multiverify(leaves, pkg["proof"], cp[1], cp[4], hc):
+                return None
+            self.stats["hist_records_fetched"] += len(recs)
+            return ({i: (rec.X, rec.X0) for i, (rec, _) in recs.items()},
+                    {i: ent for i, (_, ent) in recs.items()})
+        return cp, fetch
+
+    # ================================================================ Phase 3: verify-before-release ACL
+    def _acl_check(self, q: dict, req: dict, cp: tuple | None, fetch, hc, summer, historical: bool):
+        """Algorithm alg:acl for one protected query; no release. Returns (ok, details)."""
+        level = self.cfg.acl_level
+        if cp is None:  # checkpoint of a past epoch not authenticated
+            return False, dict(Q=set(), aggs=req["aggs"], realness=req["realness"], sampled=None, ents=None,
+                               chi=None, cq=None, rho=None)
+        spec = lineage.c_spec(q)
+        chi = lineage.c_chi(q, cp, hc)
+        aggs, realness = req["aggs"], req["realness"]
+        ok = level == "none" or lineage.verify_postings(cp[2], q["tokens"], req["postings"], req["proof"], hc)
+        Q = {rid[1] for rid in req["Q"]}
+        if ok and level != "none":
+            Q = lineage.candidates_from(q["tokens"], req["postings"], cp[4])
+            ok = Q == {rid[1] for rid in req["Q"]}
+        cq = lineage.c_q(chi, Q, hc)
+        if ok and level != "none":
+            ok = cq == req["C_Q"]
+        sampled = None
+        if ok and level == "full":
+            sampled = self._spot()
+            self.stats["acl_sampled" if sampled else "acl_skipped"] += 1
+        ents = None
+        if ok and (sampled or historical):
+            got = fetch(Q, hc)
+            if got is None:
+                ok = False
+            else:
+                X, ents = got
+        if ok and sampled:
+            feat_index = {f: j for j, f in enumerate(self.cfg.agg_features)}
+            src = lambda i: ents[i].tokens[3]  # noqa: E731
+            aggs, realness = lineage.aggregate(q, Q, X.__getitem__, src, feat_index, self.he, summer)
+            ok = (all(int(aggs[f]) == int(req["aggs"][f]) for f in q["feats"])
+                  and int(realness) == int(req["realness"]))
+        ca = lineage.c_a(cq, q["feats"], aggs, realness, hc, spec=spec)
+        if ok and level == "full":
+            ok = ca == req["C_A"]
+        rho = lineage.acl_record(chi, cq, ca, hc, spec=spec) if ok else None
+        return ok, dict(Q=Q, aggs=aggs, realness=realness, sampled=sampled, ents=ents, chi=chi, cq=cq, rho=rho)
+
+    def _summer(self, adds: list):
+        def summer(cts):
+            acc = None
+            for c in cts:
+                acc = c if acc is None else self.he.add(acc, c)
+                adds[0] += 1
+            return acc if acc is not None else ZERO  # empty sum: the identity, Enc(0; r = 1)
+        return summer
+
+    def acl_release(self, q: dict, req: dict, cohort_ok: bool = True, kind: str = "phase3") -> dict | None:
+        """Algorithm alg:acl on Req_q = (Q_q, candidate set, postings, pi^IDX, A_q, C_Q, C_A).
+        On success the EE obtains the KA release and returns Z_q with rho_q; None on failure.
+        cohort_ok=False (a cover of the same cohort failed): the request is still verified, so the
+        work is the same, but rejected with the whole cohort."""
+        hc, adds = HashCounter(), [0]
+        epoch = q["epoch"]
+        historical = epoch != self.epoch
+        t0 = time.perf_counter()
+        cp, fetch = self._ctx(epoch)
+        ok, r = self._acl_check(q, req, cp, fetch, hc, self._summer(adds), historical)
+        ok = ok and cohort_ok
+        dt = time.perf_counter() - t0
+        self.acl_log.append(dict(kind=kind, qid=q["qid"], epoch=epoch, ok=int(ok), seconds=dt,
+                                 hashes=hc.count, he_adds=adds[0], q=len(req["Q"]),
+                                 postings=sum(len(v) for v in req["postings"].values()),
+                                 sampled=None if r["sampled"] is None else int(r["sampled"]),
+                                 historical=int(historical)))
+        if not ok:
+            self.stats["acl_reject"] += 1
+            # the context keeps its slot with no evidence (fixed feature dimension)
+            self.accepted[q["qid"]] = dict(qid=q["qid"], attack=q["attack"], epoch=epoch, Q=set(), y={},
+                                           phi=(0, 0, 0), rho=None, rejected=True)
+            return None
+        Q, aggs, realness = r["Q"], r["aggs"], r["realness"]
+        ents = r["ents"] if r["ents"] is not None else self.epoch_entries
+        self.bus.send("ee", "ka", "release_req", (q["qid"], epoch, aggs, realness))
+        y = self.ka.release(q["qid"], epoch, q["policy"], q["threshold"], aggs, realness)
+        self.bus.send("ka", "ee", "release", y)
+        rids = {(epoch, i) for i in Q}
+        phi = (len(Q), len({ents[i].tokens[3] for i in Q}), len({ents[i].bucket for i in Q}))
+        z = dict(qid=q["qid"], attack=q["attack"], epoch=epoch, Q=rids, y=y, phi=phi, rho=r["rho"])
+        self.accepted[q["qid"]] = z
+        return z
+
+    def verify_cover(self, q: dict, req: dict) -> bool:
+        """Journal r1: a cover query is verified exactly like the real one (no release)."""
+        hc, adds = HashCounter(), [0]
+        historical = q["epoch"] != self.epoch
+        t0 = time.perf_counter()
+        cp, fetch = self._ctx(q["epoch"])
+        ok, r = self._acl_check(q, req, cp, fetch, hc, self._summer(adds), historical)
+        self.acl_log.append(dict(kind="phase3_cover", qid=q["qid"], epoch=q["epoch"], ok=int(ok),
+                                 seconds=time.perf_counter() - t0, hashes=hc.count, he_adds=adds[0],
+                                 q=len(req["Q"]), postings=sum(len(v) for v in req["postings"].values()),
+                                 sampled=None if r["sampled"] is None else int(r["sampled"]),
+                                 historical=int(historical)))
+        return ok
+
+    def _spot(self) -> bool:
+        """Spot-check gate (journal v3): True when this check is recomputed."""
+        return self.cfg.acl_sample >= 1.0 or self._acl_rng.random() < self.cfg.acl_sample
+
+    # ================================================================ Phase 4: graph-lineage verification
+    def verify_graph(self, updates: list[tuple], drift: float) -> tuple[list[tuple], float]:
+        """Rebuild the attack-relevant contracted neighbourhoods from the accepted Phase 3
+        evidence and admit only cloud updates whose C_G matches (journal Phase 4, Step 5)."""
+        if self.cfg.acl_level != "full":  # No-ACL / Retrieval-Only: graph updates taken as given
+            self.mu_prev = None
+            return updates, drift
+        hc = HashCounter()
+        t0 = time.perf_counter()
+        Z = list(self.accepted.values())
+        profiles = {a: frozenset(self.token("C", c) for c in p.categories) for a, p in self.profiles.items()}
+        entry_of = lambda rid: self.epoch_entries[rid[1]]  # noqa: E731
+        chosen = None  # spot-check: entity tokens whose neighbourhoods are re-contracted (None: all)
+        if self.cfg.acl_sample < 1.0:
+            # an entity's update depends only on the evidence records of that entity, so contracting the
+            # evidence restricted to the sampled entities gives exactly their updates (and C_G)
+            ents = sorted({entry_of(rid).tokens[0] for z in Z for rid in z["Q"]})
+            chosen = {t for t in ents if self._acl_rng.random() < self.cfg.acl_sample}
+            Zs = [dict(z, Q={rid for rid in z["Q"] if entry_of(rid).tokens[0] in chosen}) for z in Z]
+            mine, _ = lineage.contract(Zs, entry_of, profiles, hc)
+            _, mu = lineage.contract(Z, entry_of, {}, None)  # epoch profile for the drift check (no hashing)
+            self.stats["graph_sampled"] += len(chosen)
+            self.stats["graph_skipped"] += len(ents) - len(chosen)
+        else:
+            mine, mu = lineage.contract(Z, entry_of, profiles, hc)
+        expected = {(u[0], u[1]): u for u in mine}
+        admitted, bad = [], 0
+        for upd in updates:
+            if chosen is not None and upd[0] not in chosen:
+                admitted.append(upd)  # not sampled this epoch: admitted unchecked
+                continue
+            ref = expected.pop((upd[0], upd[1]), None)
+            if ref is not None and upd[4] == ref[4] and list(upd[2]) == list(ref[2]) and upd[3] == ref[3]:
+                admitted.append(upd)
+            else:
+                bad += 1
+        omitted = len(expected)
+        my_drift = lineage.drift(mu, self.mu_prev)
+        drift_ok = abs(my_drift - drift) <= 1e-12
+        self.mu_prev = mu
+        dt = time.perf_counter() - t0
+        self.acl_log.append(dict(kind="phase4", epoch=self.epoch, ok=int(not bad and not omitted and drift_ok),
+                                 seconds=dt, hashes=hc.count, he_adds=0, q=len(updates), rejected=bad,
+                                 omitted=omitted))
+        self.stats["graph_reject"] += bad
+        self.stats["graph_omitted"] += omitted
+        self.stats["drift_reject"] += int(not drift_ok)
+        if self.cfg.graph_real_only and self.decoy_rids:
+            # drift over real records only (see _real_graph)
+            Zc = [dict(z, Q=set(z["Q"]) - self.decoy_rids) for z in Z]
+            _, mu_c = lineage.contract(Zc, lambda rid: self.epoch_entries[rid[1]], {}, None)
+            my_drift = lineage.drift(mu_c, self._mu_clean)
+            self._mu_clean = mu_c
+        return admitted, my_drift
+
+    # ================================================================ Phase 5, Step 6: screening
+    def _xi(self, key: bytes) -> float:
+        c, m = self.cms_cur.query(key), self.cms_base.query(key)
+        return (c - m) ** 2 / max(m, 1.0) if c > m else 0.0
+
+    def _screen(self, refs_by_user: dict[str, set]) -> None:
+        """Evaluated at bucket closure, when references exist (Phase 5, Step 6)."""
+        self.buckets_seen += 1
+        if self.buckets_seen > 6:  # warm-up: baseline needs a few buckets
+            pairs = defaultdict(set)
+            for ev in self.bucket_events:
+                pairs[ev.user].add((ev.res, ev.cat))
+            for u, obs in pairs.items():
+                psi = max([self._xi(H(u.encode()))] + [self._xi(H(encode(u, r, c))) for r, c in obs])
+                if psi >= self.chi2_threshold:
+                    d = Descriptor(self.epoch, self.token("U", u), None, psi, None, frozenset(refs_by_user[u]))
+                    self.bus.send("ee", "sa", "alert", d)
+                    self.sa.receive_alert(d)
+        self.cms_base.decay_into(self.cms_cur, math.exp(-self.cfg.screen_decay))
+        self.cms_cur.clear()
+
+    # ================================================================ Phase 3/4 inputs
+    def make_queries(self) -> list[dict]:
+        """Q_q^(e) for every context (eq:protected-query)."""
+        qs = []
+        for slot, c in enumerate(self.contexts):
+            tok = {}
+            for dim, vals in zip(DIMS, (c.users, c.resources, c.categories, c.sources)):
+                if vals:
+                    tok[dim] = frozenset(self.token(dim, v) for v in vals)
+            weights = {self.token("S", s): w for s, w in c.source_weights.items()}
+            q = dict(qid=c.qid, attack=c.attack, epoch=self.epoch, tokens=tok, feats=c.feats,
+                     policy=c.policy, threshold=c.threshold, source_weights=weights, slot=slot)
+            qs.append(self.bus.send("ee", "cloud", "query", q))
+        return qs
+
+    def _hunt_query(self, m: Spec, epoch: int | None = None, keys: dict | None = None) -> dict:
+        self._hunt_n += 1
+        e = self.epoch if epoch is None else epoch
+        qid = H(encode("hunt", self.epoch, self._hunt_n, self.rng.getrandbits(64))).hex()[:16]  # opaque
+        tok = {m.dim: frozenset({self.token(m.dim, m.value, e, keys)})}
+        if m.cats is not None:
+            tok["C"] = frozenset(self.token("C", c, e, keys) for c in m.cats)
+        if m.buckets is not None:  # time filter: bucket labels are plaintext metadata of every record
+            tok["B"] = frozenset(m.buckets)
+        return dict(qid=qid, attack="hunt", epoch=e, tokens=tok, feats=("count",),
+                    policy=Policy.VALUE, threshold=0.0, source_weights={}, slot=-1)
+
+    def _hist_cohort(self, s: Spec, tau: int):
+        """Journal r1: the cohort of a hunt over finalized epoch tau is the group of s.value in the
+        encrypted partition P~_tau committed in CP_tau (Phase 6 rebuilds groups the same way)."""
+        keys = self.bus.send("ka", "ee", "hist_keys", self.ka.epoch_keys(tau))
+        groups = self._hist_groups(tau, keys, self._verified_cp(tau)) or {}
+        g, sub = groups.get((s.dim, s.value), ((s.value,), (s.value,)))
+        members = [s] + [replace(s, value=v) for v in g if v != s.value]
+        info = dict(spec=s, n_issue=None, risk=None, pi=None, cls=None, k=len(g), k_eff=len(members), slot=0)
+        return members, info, keys
+
+    def hunt(self, specs: list[Spec], epoch: int | None = None) -> list[dict]:
+        """AQRS-assisted hunting queries (journal Phase 3): per issue, the cohort is sent in random
+        order and the cloud processes every member alike. With cfg.aqrs_verify == "all" (journal r1)
+        the EE verifies every member alike and rejects the whole cohort if any check fails; only the
+        real member's result is released, cover results are dropped here. epoch: a finalized past
+        epoch (journal r1 historical hunt) instead of the epoch just closed. Returns the real evidence."""
+        hist = epoch is not None and epoch != self.epoch
+        feat_index = {f: j for j, f in enumerate(self.cfg.agg_features)}
+        out = []
+        for s in specs:
+            if hist:
+                members, info, keys = self._hist_cohort(s, epoch)
+            else:
+                (members, info), keys = self.aqrs.issue(s), None
+            qs = [self._hunt_query(m, epoch, keys) for m in members]
+            real = qs[0]
+            order = qs[:]
+            self.rng.shuffle(order)
+            t0, he0 = time.perf_counter(), self.cloud.he_adds
+            self.bus.send("ee", "cloud", "cohort", dict(epoch=real["epoch"], queries=order, slot=info["slot"]))
+            reqs = self.cloud.cohort(order, feat_index)
+            t1 = time.perf_counter()
+            cohort_ok = True
+            if self.cfg.aqrs_verify == "all":
+                for q in order:  # covers in cohort order, each exactly like the real query
+                    if q is not real:
+                        cohort_ok = self.verify_cover(q, reqs[q["qid"]]) and cohort_ok
+            z = self.acl_release(real, reqs[real["qid"]], cohort_ok=cohort_ok)
+            if self.cfg.aqrs_graph != "cloud" or hist:
+                self.accepted.pop(real["qid"], None)  # contracted inside the EE (D28)
+            dt = time.perf_counter() - t0
+            self.hunt_log.append(dict(info, epoch=real["epoch"], real=real["qid"], members=[q["qid"] for q in order],
+                                      seconds=dt, verify_seconds=time.perf_counter() - t1, ok=z is not None,
+                                      cohort_ok=cohort_ok, historical=hist, he_adds=self.cloud.he_adds - he0,
+                                      retrieved=sum(len(r["Q"]) for r in reqs.values()),
+                                      real_size=len(reqs[real["qid"]]["Q"])))
+            if z is not None:
+                out.append(z)
+        return out
+
+    def graph_profiles(self) -> dict[str, frozenset]:
+        """(M_a) tokenized for this epoch; only the graph part of P_a goes to the cloud."""
+        out = {a: frozenset(self.token("C", c) for c in p.categories) for a, p in self.profiles.items()}
+        return self.bus.send("ee", "cloud", "graph_profiles", out)
+
+    # ================================================================ Phase 5: trusted history
+    @staticmethod
+    def _dot(w, x) -> float:
+        return sum(a * b for a, b in zip(w, x))
+
+    def _hist_score(self, p: AttackProfile, h: list[float]) -> float:
+        """r(h): the historical contribution permitted by J_a^hist (all features here).
+        Ablation A2 (history=False) scores each epoch alone."""
+        if not self.cfg.history:
+            return 0.0
+        if p.theta_r is not None:
+            return self._dot(p.theta_r, h)
+        n = len(GRAPH_FEATURES)
+        return self._dot(p.theta_g, h[:n]) + self._dot(p.theta_y, h[n:])
+
+    def _prune(self, prov: set, horizon: int) -> set:
+        return {rid for rid in prov if rid[0] >= self.epoch - horizon + 1}
+
+    def _lambda(self, p: AttackProfile, drift: float, R: float) -> float:
+        """Adaptive decay (eq:adaptive-decay); FixedDecay ablation keeps lambda0."""
+        if self.cfg.fixed_decay:
+            return p.lambda0
+        return min(max(p.lambda0 + p.alpha * drift - p.beta * R, p.lambda_min), p.lambda_max)
+
+    def _explicit_h(self, st: _PairState) -> list[float]:
+        """NoContract: rebuild h from the explicit per-epoch history (same values as the
+        recursive update, but the state grows with the processed epochs)."""
+        dim = len(st.h)
+        h = [0.0] * dim
+        for _, z, rho in st.zs:
+            h = [rho * hv + (1 - rho) * zv for hv, zv in zip(h, z)] if z is not None else [rho * hv for hv in h]
+        return h
+
+    def state_size(self) -> int:
+        """Floats and references held in trusted historical state (evaluation of NoContract)."""
+        n = 0
+        for st in self.state.values():
+            n += len(st.h) + 1 + len(st.prov) + sum(len(z) + 2 if z is not None else 2 for _, z, _ in st.zs)
+        return n
+
+    def _key(self, u: str, a: str) -> tuple:
+        if self.cfg.profile_bind:
+            return (u, a, lineage.pid(self.profiles[a]))
+        return (u, a)
+
+    def _new_state(self, a: str, dim: int) -> _PairState:
+        p = self.profiles[a]
+        g = lineage.genesis(lineage.pid(p)) if self.cfg.profile_bind else GENESIS
+        return _PairState([0.0] * dim, C_H=g, born=p.version)
+
+    def _window_h(self, st: _PairState, dim: int) -> list[float]:
+        """Fixed-Window: h = (1/W) sum of z over the last W epochs (no decay, hard cut-off)."""
+        W = self.cfg.hist_window
+        st.win = [(ep, z) for ep, z in st.win if ep > self.epoch - W]
+        h = [0.0] * dim
+        for _, z in st.win:
+            h = [hv + zv / W for hv, zv in zip(h, z)]
+        return h
+
+    def update_profile(self, p: AttackProfile) -> None:
+        """Deploy a new version of P_a. With pid binding the next epochs start new lineages
+        (fresh genesis); the retired lineages are dropped. No-Profile-Bind keeps them."""
+        self.profiles[p.name] = p
+        if self.cfg.profile_bind:
+            cur = lineage.pid(p)
+            for key in [k for k in self.state if k[1] == p.name and k[2] != cur]:
+                del self.state[key]
+                self.stats["lineage_retired"] += 1
+
+    def _real_graph(self, updates: list[tuple]) -> list[tuple]:
+        """D30: the cloud's graph features count decoys, which it cannot tell apart, so padding
+        inflates degrees and bucket spreads of padded entities. After the C_G check the EE recomputes
+        them from the update's references minus its own decoys (EE-local; the cloud sees nothing new).
+        Same features as lineage.contract: degree, resources, sources, relations, buckets."""
+        ng, out = len(GRAPH_FEATURES), []
+        for upd in updates:
+            real = [self.epoch_entries[rid[1]] for rid in upd[3] if rid not in self.decoy_rids]
+            g = [len(real), len({x.tokens[1] for x in real}), len({x.tokens[3] for x in real}),
+                 len({(x.tokens[1], x.tokens[2]) for x in real}), len({x.bucket for x in real})]
+            out.append((upd[0], upd[1], g + list(upd[2][ng:]), *upd[3:]))
+        return out
+
+    def phase5(self, updates: list[tuple], drift: float) -> list[Descriptor]:
+        if self.cfg.acl:
+            updates, drift = self.verify_graph(updates, drift)
+        if self.cfg.graph_real_only and self.decoy_rids:
+            updates = self._real_graph(updates)
+        e, alerts, seen = self.epoch, [], set()
+        n = len(GRAPH_FEATURES)
+        for upd in updates:
+            T_u, a, z, refs = upd[:4]
+            if T_u in self.dummy[e]:
+                self.stats["dummy_updates_discarded"] += 1
+                continue
+            u = self.user_of[e].get(T_u)
+            if u is None:
+                continue
+            if self.cfg.no_graph:
+                z = [0.0] * n + list(z[n:])
+            p = self.profiles[a]
+            key = self._key(u, a)
+            st = self.state.get(key) or self._new_state(a, len(z))
+            lam = self._lambda(p, drift, st.R)
+            rho = math.exp(-lam)
+            horizon = math.ceil(math.log(self.cfg.eps_h) / math.log(rho))
+            if self.cfg.hist_window:
+                horizon = self.cfg.hist_window
+                st.h = self._window_h(st, len(z))
+            if not self.cfg.contract:
+                st.h = self._explicit_h(st)
+            S = self._dot(p.theta_g, z[:n]) + self._dot(p.theta_y, z[n:]) + p.theta_h * self._hist_score(p, st.h)
+            h_prev = tuple(st.h)
+            st.R = _sigmoid(p.kappa * (S - p.Theta))
+            if self.cfg.hist_window:
+                st.win.append((e, tuple(z)))
+                st.h = self._window_h(st, len(z))
+            else:
+                st.h = [rho * hv + (1 - rho) * zv for hv, zv in zip(st.h, z)]
+            if not self.cfg.contract:
+                st.zs.append((e, tuple(z), rho))
+            st.prov = self._prune(st.prov | set(refs), horizon)
+            if self.cfg.acl:
+                st.C_H = lineage.c_h(st.C_H, upd[4], st.h, st.R, st.prov)
+            self.state[key] = st
+            seen.add(key)
+            self.score_log.append((e, u, a, S, tuple(z), h_prev))
+            self.horizon_log.append((e, u, a, horizon, lam, len(st.prov), rho))
+            if S >= p.Theta:
+                d = Descriptor(e, T_u, a, S, horizon, frozenset(st.prov), st.C_H if self.cfg.acl else None)
+                self.bus.send("ee", "sa", "alert", d)
+                self.sa.receive_alert(d)
+                alerts.append(d)
+                self.alert_log.append(dict(epoch=e, user=u, attack=a, version=p.version, born=st.born,
+                                           prov_epochs=sorted({r[0] for r in st.prov})))
+        for key in list(self.state):
+            if key in seen:
+                continue
+            st, p = self.state[key], self.profiles[key[1]]
+            rho = math.exp(-self._lambda(p, drift, st.R))
+            if self.cfg.hist_window:
+                st.h = self._window_h(st, len(st.h))
+                st.prov = self._prune(st.prov, self.cfg.hist_window)
+            else:
+                st.h = [rho * hv for hv in st.h]
+                st.prov = self._prune(st.prov, math.ceil(math.log(self.cfg.eps_h) / math.log(rho)))
+            if not self.cfg.contract:
+                st.zs.append((e, None, rho))
+            if self.cfg.acl:
+                # idle decay: C_empty commits to the inactive epoch (eq:inactive-commitment)
+                self.stats["idle_commit"] += 1
+                st.C_H = lineage.c_h(st.C_H, lineage.c_inactive(e, key[1]), st.h, st.R, st.prov)
+            if self.cfg.contract and math.sqrt(sum(v * v for v in st.h)) < self.cfg.eps_h and not st.prov:
+                del self.state[key]  # NoContract keeps its explicit history
+        return alerts
+
+    # ================================================================ Phase 6: historical tokens
+    def resolve_current(self, epoch: int, token: bytes) -> str | None:
+        return self.user_of[epoch].get(token)
+
+    def _inv_tokens(self, user: str, attack: str | None, tau: int, keys: dict) -> dict:
+        tok = {"U": frozenset({self.token("U", user, tau, keys)})}
+        if attack is not None:
+            for dim, attr in (("R", "resources"), ("C", "categories"), ("S", "sources")):
+                vals = set().union(*(getattr(c, attr) for c in self.contexts if c.attack == attack))
+                if vals:
+                    tok[dim] = frozenset(self.token(dim, v, tau, keys) for v in vals)
+        return tok
+
+    def investigation_queries(self, user: str, attack: str | None, window: range) -> dict[int, dict]:
+        """Q_{a,inv}^(tau) per epoch tau in the authorized window (eq:investigation-query)."""
+        out = {}
+        for tau in window:
+            keys = self.bus.send("ka", "ee", "hist_keys", self.ka.epoch_keys(tau))
+            out[tau] = self.bus.send("ee", "cloud", "inv_query", self._inv_tokens(user, attack, tau, keys))
+        return out
+
+    def investigation_cohort(self, user: str, attack: str | None, window: range) -> dict[int, dict]:
+        """Journal r1 (Phase 6, Steps 1-2): for every window epoch, the investigation queries of every
+        member of the alerted entity's group K_tau(u), identical filters, random order. Returns
+        tau -> dict(members=[token sets], real=index of u's query); the group comes from P~_tau."""
+        out = {}
+        for tau in window:
+            keys = self.bus.send("ka", "ee", "hist_keys", self.ka.epoch_keys(tau))
+            groups = self._hist_groups(tau, keys, self._verified_cp(tau)) or {}
+            g, _ = groups.get(("U", user), ((user,), (user,)))
+            vals = list(dict.fromkeys((user,) + tuple(g)))
+            self.rng.shuffle(vals)
+            toks = [self.bus.send("ee", "cloud", "inv_query", self._inv_tokens(v, attack, tau, keys)) for v in vals]
+            out[tau] = dict(members=toks, real=vals.index(user))
+        return out

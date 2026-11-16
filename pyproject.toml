@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vista-siem"
+version = "0.1.0"
+description = "Reference implementation and experiments of VISTA-SIEM (IEEE TCC submission)"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42",
+    "gmpy2>=2.1",
+    "msgpack>=1.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pandas>=2"]
+experiments = ["scikit-learn>=1.4", "scipy>=1.11"]
+baselines = ["tenseal>=0.3", "torch>=2.2", "lightgbm>=4", "py_ecc>=7", "pandas>=2", "pyarrow>=14"]
+
+[tool.setuptools.packages.find]
+include = ["vista_siem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
